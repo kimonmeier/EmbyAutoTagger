@@ -1,0 +1,64 @@
+name: Docker Build and Publish
+
+on:
+  push:
+    branches: [ "main" ]
+    # Triggert den Build auch, wenn du ein Git-Tag wie v1.0.0 verpasst
+    tags: [ 'v*.*.*' ]
+  workflow_dispatch: # Erlaubt es dir, den Build manuell auf GitHub zu starten
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  
+permissions:
+  contents: write      # to checkout the code
+  packages: write     # to push Docker images to GitHub Packages (ghcr.io)
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # Zwingend erforderlich, um in GHCR zu schreiben
+
+    steps:
+      - name: Code auschecken
+        uses: actions/checkout@v4
+
+      # Richtet Buildx ein, das für erweitertes Caching und Multi-Platform-Builds sorgt
+      - name: Docker Buildx einrichten
+        uses: docker/setup-buildx-action@v3
+
+      # Meldet sich automatisch bei der GitHub Registry an
+      - name: Bei der GitHub Container Registry anmelden
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generiert automatisch die passenden Tags (z.B. "latest", "main" oder die Versionsnummer)
+      - name: Docker-Metadaten extrahieren
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      # Baut das Image anhand deines Dockerfiles und pusht es
+      - name: Docker Image bauen und pushen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Nutzt GitHub Actions Caching, damit die darauffolgenden Builds blitzschnell sind
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
