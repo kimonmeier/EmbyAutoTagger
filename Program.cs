@@ -1,24 +1,29 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
+using Emby.ApiClient.Api;
+using Emby.ApiClient.Client;
+using Emby.ApiClient.Client.Authentication;
+using Emby.ApiClient.Model;
+using RestSharp;
 
 namespace EmbyAutoTagger;
 
 public class Program
 {
-    private readonly static HttpClient client = new HttpClient();
-
     async static Task Main(string[] args)
     {
         // Konfiguration aus Umgebungsvariablen laden
         string embyUrl = Environment.GetEnvironmentVariable("EMBY_URL")?.TrimEnd('/') ?? "http://localhost:8096";
         string apiKey = Environment.GetEnvironmentVariable("EMBY_API_KEY") ?? "";
         string intervalEnv = Environment.GetEnvironmentVariable("SYNC_INTERVAL_MINUTES") ?? "60";
+        string tags = Environment.GetEnvironmentVariable("TAGS") ?? "";
 
         if (string.IsNullOrEmpty(apiKey))
         {
@@ -27,9 +32,24 @@ public class Program
             return;
         }
 
+        if (string.IsNullOrEmpty(tags))
+        {
+            Console.WriteLine("[ERROR] TAGS wurde nicht gesetzt! Das Programm wird beendet.");
+
+            return;
+        }
+        
         if (!int.TryParse(intervalEnv, out int intervalMinutes) || intervalMinutes <= 0)
         {
             intervalMinutes = 60;
+        }
+        
+        var tagList = JsonSerializer.Deserialize<NameLongIdPair[]>(tags);
+
+        if (tagList == null || !tagList.Any())
+        {
+            Console.WriteLine("[ERROR] TAGS konnte nicht deserialisiert werden! Das Programm wird beendet.");
+            return;
         }
 
         Console.WriteLine($"[INFO] Emby Auto-Tagger gestartet.");
@@ -41,7 +61,7 @@ public class Program
             try
             {
                 Console.WriteLine($"[INFO] ({DateTime.Now}) Starte Synchronisation...");
-                await SyncEmbyTags(embyUrl, apiKey);
+                await SyncEmbyTags(embyUrl, apiKey, tagList);
                 Console.WriteLine($"[INFO] ({DateTime.Now}) Synchronisation erfolgreich abgeschlossen.");
             }
             catch (Exception ex)
@@ -54,67 +74,167 @@ public class Program
         }
     }
 
-    private async static Task SyncEmbyTags(string embyUrl, string apiKey)
+    private async static Task SyncEmbyTags(string embyUrl, string apiKey, NameLongIdPair[] tagList)
     {
-        // 1. Alle Filme abrufen, inklusive OfficialRating und Tags
-        // Wir filtern nach 'Movie' und nutzen 'Recursive=true' um die ganze Mediathek zu durchsuchen
-        string url = $"{embyUrl}/emby/Items?api_key={apiKey}&IncludeItemTypes=Movie&Recursive=true&Fields=OfficialRating,Tags";
 
-        var response = await client.GetFromJsonAsync<EmbyQueryResponse>(url);
-        if (response?.Items == null || response.Items.Count == 0)
+        ApiClient apiClient = new ApiClient(embyUrl, new EmbyApiKeyAuthenticator(apiKey));
+
+        const int pageSize = 500;
+        int startIndex = 0;
+        int total;
+
+        do
         {
-            Console.WriteLine("[INFO] Keine Filme in Emby gefunden.");
+            var url =
+                $"emby/Items?Recursive=true" +
+                $"&IncludeItemTypes=Movie" +
+                $"&Fields=Tags,OfficialRating" +
+                $"&StartIndex={startIndex}" +
+                $"&Limit={pageSize}";
 
-            return;
-        }
+            var page = await apiClient.RestClient.ExecuteGetAsync<QueryResultBaseItemDto>(url);
 
-        foreach (var item in response.Items)
-        {
-            // Wenn kein Rating vorhanden ist, überspringen
-            if (string.IsNullOrWhiteSpace(item.OfficialRating))
-                continue;
-
-            // Mapping der Altersfreigabe zum gewünschten Schweizer Intro-Tag
-            // Schweizer Kinos nutzen meist rein numerische Werte (6, 8, 12, 14, 16, 18)
-            // Hier kannst du das Mapping anpassen, falls Emby z.B. "DE-12" oder "FSK-12" liefert.
-            string cleanRating = ExtractNumericRating(item.OfficialRating);
-
-            if (string.IsNullOrEmpty(cleanRating))
-                continue;
-
-            string targetTag = $"CH-{cleanRating}";
-
-            // Initialisiere die Tag-Liste, falls sie null ist
-            item.Tags ??= new List<string>();
-
-            // Prüfen, ob das Tag bereits existiert
-            if (!item.Tags.Contains(targetTag, StringComparer.OrdinalIgnoreCase))
+            if (page.Data == null || page.Data.TotalRecordCount == 0)
             {
-                item.Tags.Add(targetTag);
+                if (startIndex == 0)
+                    Console.WriteLine("[INFO] Keine Filme in Emby gefunden.");
+                return;
+            }
 
-                // Update an Emby senden
-                bool success = await UpdateItemTags(embyUrl, apiKey, item);
-                if (success)
+            total = page.Data.TotalRecordCount ?? 0;
+
+            foreach (var item in page.Data.Items)
+            {
+                if (string.IsNullOrWhiteSpace(item.OfficialRating))
+                    continue;
+
+                string cleanRating = ExtractNumericRating(item.OfficialRating);
+                if (string.IsNullOrEmpty(cleanRating))
+                    continue;
+
+                
+                
+                string targetTag = $"CH-{cleanRating}";
+
+                item.TagItems ??= new List<NameLongIdPair>();
+
+                if (!item.TagItems.Any(x => x.Name.Equals(targetTag, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Console.WriteLine($"[ADDED] Tag '{targetTag}' zu Film hinzugefügt: {item.Name} (Rating war: {item.OfficialRating})");
-                }
-                else
-                {
-                    Console.WriteLine($"[FAILED] Konnte Tag für '{item.Name}' nicht aktualisieren.");
+                    var tag = tagList.FirstOrDefault(x => x.Name.Equals(targetTag, StringComparison.OrdinalIgnoreCase));
+
+                    if (tag == null)
+                    {
+                        // Find next higher rating
+                        if (int.TryParse(cleanRating, out int currentRating))
+                        {
+                            var availableRatings = tagList
+                                .Select(t => new { Tag = t, Rating = ExtractNumericRating(t.Name ?? "") })
+                                .Where(x => !string.IsNullOrEmpty(x.Rating) && int.TryParse(x.Rating, out _))
+                                .Select(x => new { x.Tag, RatingValue = int.Parse(x.Rating) })
+                                .OrderBy(x => x.RatingValue)
+                                .ToList();
+
+                            tag = availableRatings.FirstOrDefault(x => x.RatingValue >= currentRating)?.Tag;
+                        }
+                    }
+
+                    if (tag != null)
+                    {
+                        // Remove all existing CH-* tags that don't match the target
+                        var existingChTags = item.TagItems
+                            .Where(t => t.Name != null && t.Name.StartsWith("CH-", StringComparison.OrdinalIgnoreCase))
+                            .Where(t => !t.Name.Equals(tag.Name, StringComparison.OrdinalIgnoreCase))
+                            .ToList();
+
+                        foreach (var existingTag in existingChTags)
+                        {
+                            await RemoveItemTag(item.Id, existingTag.Name, existingTag.Id, apiClient);
+                            Console.WriteLine($"[REMOVED] Tag '{existingTag.Name}' von Film entfernt: {item.Name}");
+                        }
+
+                        bool success = await AddItemTag(item.Id, tag.Name, tag.Id, apiClient);
+                        if (success)
+                        {
+                            string usedTag = tag.Name ?? "";
+                            if (usedTag.Equals(targetTag, StringComparison.OrdinalIgnoreCase))
+                            {
+                                Console.WriteLine($"[ADDED] Tag '{targetTag}' zu Film hinzugefügt: {item.Name} (Rating war: {item.OfficialRating})");
+                            }
+                            else
+                            {
+                                Console.WriteLine($"[ADDED] Tag '{usedTag}' (nächsthöheres Rating) zu Film hinzugefügt: {item.Name} (Rating war: {item.OfficialRating}, Ziel war: {targetTag})");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[FAILED] Konnte Tag für '{item.Name}' nicht aktualisieren.");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[SKIPPED] Kein passendes Tag gefunden für '{item.Name}' mit Rating {item.OfficialRating}");
+                    }
                 }
             }
-        }
+
+            startIndex += pageSize;
+        } while (startIndex < total);
     }
 
-    private async static Task<bool> UpdateItemTags(string embyUrl, string apiKey, EmbyItem item)
+    private async static Task<bool> AddItemTag(string movieId, string rating, long? ratingId, ApiClient client)
     {
-        // Emby verlangt für Updates ein POST auf das spezifische Item
-        string updateUrl = $"{embyUrl}/emby/Items/{item.Id}?api_key={apiKey}";
+        var url = $"Items/{movieId}/Tags/Add";
 
-        // Wir senden das modifizierte Item-Objekt zurück
-        var response = await client.PostAsJsonAsync(updateUrl, item);
+        object request = new
+        {
+            tags = new dynamic[]
+            {
+                new
+                {
+                    name = rating,
+                    id = ratingId,
+                }
+            }
+        };
 
-        return response.IsSuccessStatusCode;
+        var response =  await client.RestClient.PostJsonAsync(url, request);
+
+        if (response != HttpStatusCode.NoContent)
+        {
+            Console.WriteLine($"[ERROR] Fehler beim Aktualisieren des Items: {response}");
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private async static Task<bool> RemoveItemTag(string movieId, string rating, long? ratingId, ApiClient client)
+    {
+        var url = $"Items/{movieId}/Tags/Delete";
+
+        object request = new
+        {
+            tags = new dynamic[]
+            {
+                new
+                {
+                    name = rating,
+                    id = ratingId
+                }
+            }
+        };
+
+        var response =  await client.RestClient.PostJsonAsync(url, request);
+
+        if (response != HttpStatusCode.NoContent)
+        {
+            Console.WriteLine($"[ERROR] Fehler beim Entfernen des Tags: {response}");
+            
+            return false;
+        }
+
+        return true;
     }
 
     // Hilfsfunktion, um aus "FSK 12", "DE-12" oder "12" nur die Zahl zu extrahieren
@@ -124,26 +244,4 @@ public class Program
 
         return digits.Length > 0 ? new string(digits) : string.Empty;
     }
-}
-
-// Datenstrukturen für die Emby-API
-public class EmbyQueryResponse
-{
-    [JsonPropertyName("Items")]
-    public List<EmbyItem> Items { get; set; } = new();
-}
-
-public class EmbyItem
-{
-    [JsonPropertyName("Id")]
-    public string Id { get; set; } = string.Empty;
-
-    [JsonPropertyName("Name")]
-    public string Name { get; set; } = string.Empty;
-
-    [JsonPropertyName("OfficialRating")]
-    public string? OfficialRating { get; set; }
-
-    [JsonPropertyName("Tags")]
-    public List<string>? Tags { get; set; } = new();
 }
